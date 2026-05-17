@@ -136,6 +136,52 @@ impl Position {
         false
     }
 
+    /// Make a null move (pass the turn). Only valid when not in check.
+    pub fn make_null_move(&mut self) {
+        let irr = Irreversible {
+            castling: self.castling,
+            ep_square: self.ep_square,
+            halfmove_clock: self.halfmove_clock,
+            zobrist: self.zobrist,
+            captured_piece: None,
+        };
+        if self.ep_square != squares::NONE {
+            self.zobrist ^= keys().ep_key(file_of(self.ep_square));
+            self.ep_square = squares::NONE;
+        }
+        self.halfmove_clock += 1;
+        self.zobrist ^= keys().side;
+        self.side = self.side.flip();
+        if self.side == Color::White { self.fullmove += 1; }
+        self.history.push(irr);
+    }
+
+    pub fn unmake_null_move(&mut self) {
+        let irr = self.history.pop().expect("unmake_null_move: empty history");
+        self.side = self.side.flip();
+        if self.side == Color::Black { self.fullmove -= 1; }
+        self.ep_square = irr.ep_square;
+        self.halfmove_clock = irr.halfmove_clock;
+        self.zobrist = irr.zobrist;
+    }
+
+    /// True if the current position is a draw by repetition (2-fold in search).
+    pub fn is_repetition(&self) -> bool {
+        if self.halfmove_clock < 4 { return false; }
+        let key = self.zobrist;
+        let len = self.history.len();
+        let lookback = (self.halfmove_clock as usize).min(len);
+        let mut count = 0usize;
+        for irr in self.history[len - lookback..].iter().rev() {
+            if irr.zobrist == key {
+                count += 1;
+                if count >= 1 { return true; } // 2-fold counts as draw in search
+            }
+            if irr.halfmove_clock == 0 { break; }
+        }
+        false
+    }
+
     pub fn make_move(&mut self, mv: Move) {
         let irr = Irreversible {
             castling: self.castling,
