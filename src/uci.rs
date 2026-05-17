@@ -1,4 +1,4 @@
-// UCI stub — Phase 1 will implement full UCI loop.
+// UCI protocol implementation.
 use crate::board::position::Position;
 use crate::board::moves::Move;
 use crate::board::types::{parse_sq, squares, rank_of, Piece, Color};
@@ -12,48 +12,134 @@ use crate::board::moves::{
 };
 use crate::board::types::{CASTLE_WK, CASTLE_WQ, CASTLE_BK, CASTLE_BQ};
 use crate::movegen::{generate_legal_moves, init_tables};
+use crate::search::{search, SearchParams};
+use crate::tt::TT;
 
 pub fn run_uci() {
     use std::io::{self, BufRead};
     let stdin = io::stdin();
     let mut pos = Position::startpos();
+    let mut tt = TT::new(32); // 32 MB TT
 
     for line in stdin.lock().lines() {
         let line = line.expect("stdin error");
         let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut tokens = line.splitn(2, ' ');
+        if line.is_empty() { continue; }
+
+        let mut tokens = line.split_whitespace();
         let cmd = tokens.next().unwrap_or("");
-        let rest = tokens.next().unwrap_or("");
+        let rest: Vec<&str> = tokens.collect();
 
         match cmd {
             "uci" => {
                 println!("id name Athene-noctua");
-                println!("id author Athene-noctua Authors");
+                println!("id author Claude");
+                println!("option name Hash type spin default 32 min 1 max 2048");
                 println!("uciok");
             }
             "isready" => println!("readyok"),
             "ucinewgame" => {
                 pos = Position::startpos();
+                tt.clear();
             }
             "position" => {
-                pos = parse_position(rest);
+                pos = parse_position(&rest.join(" "));
             }
             "go" => {
-                // Phase 0: no search yet, just report that we're not ready
-                println!("bestmove 0000");
+                let params = parse_go(&rest, &pos);
+                let result = search(&mut pos, &params, &mut tt);
+                println!("bestmove {}", result.best_move.to_uci());
             }
             "stop" => {}
             "quit" => return,
+            "setoption" => {
+                // setoption name Hash value N
+                if let (Some(&"name"), Some(&"Hash"), Some(&"value"), Some(val)) =
+                    (rest.get(0), rest.get(1), rest.get(2), rest.get(3))
+                {
+                    if let Ok(mb) = val.parse::<usize>() {
+                        tt = TT::new(mb);
+                    }
+                }
+            }
             "perft" => {
-                let depth: u32 = rest.trim().parse().unwrap_or(1);
+                let depth: u32 = rest.get(0).and_then(|s| s.parse().ok()).unwrap_or(1);
                 let nodes = perft(&mut pos, depth);
                 println!("Nodes: {}", nodes);
             }
             _ => {}
         }
+    }
+}
+
+fn parse_go(tokens: &[&str], pos: &Position) -> SearchParams {
+    let mut wtime: Option<u64> = None;
+    let mut btime: Option<u64> = None;
+    let mut winc: u64 = 0;
+    let mut binc: u64 = 0;
+    let mut movestogo: u64 = 20;
+    let mut movetime: Option<u64> = None;
+    let mut depth: Option<u32> = None;
+    let mut nodes: Option<u64> = None;
+
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "wtime"     => { wtime    = tokens.get(i+1).and_then(|s| s.parse().ok()); i += 1; }
+            "btime"     => { btime    = tokens.get(i+1).and_then(|s| s.parse().ok()); i += 1; }
+            "winc"      => { winc     = tokens.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(0); i += 1; }
+            "binc"      => { binc     = tokens.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(0); i += 1; }
+            "movestogo" => { movestogo= tokens.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(20); i += 1; }
+            "movetime"  => { movetime = tokens.get(i+1).and_then(|s| s.parse().ok()); i += 1; }
+            "depth"     => { depth    = tokens.get(i+1).and_then(|s| s.parse().ok()); i += 1; }
+            "nodes"     => { nodes    = tokens.get(i+1).and_then(|s| s.parse().ok()); i += 1; }
+            "infinite"  => { depth    = Some(64); }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let start = std::time::Instant::now();
+
+    if let Some(mt) = movetime {
+        // Fixed time per move — use 95% as hard limit
+        return SearchParams {
+            start,
+            soft_limit: Some(mt * 95 / 100),
+            hard_limit: Some(mt),
+            depth_limit: depth,
+            node_limit: nodes,
+        };
+    }
+
+    // Time-control mode
+    let (our_time, our_inc) = if pos.side == Color::White {
+        (wtime, winc)
+    } else {
+        (btime, binc)
+    };
+
+    if let Some(t) = our_time {
+        // Allocate time: remaining / movestogo + increment/2, capped at 90% of remaining
+        let alloc = (t / movestogo + our_inc / 2).min(t * 9 / 10);
+        let soft = alloc;
+        let hard = (alloc * 3).min(t * 9 / 10);
+        return SearchParams {
+            start,
+            soft_limit: Some(soft),
+            hard_limit: Some(hard),
+            depth_limit: depth,
+            node_limit: nodes,
+        };
+    }
+
+    // Depth-only or node-limit mode
+    SearchParams {
+        start,
+        soft_limit: None,
+        hard_limit: None,
+        depth_limit: depth.or(Some(64)),
+        node_limit: nodes,
     }
 }
 
