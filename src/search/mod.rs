@@ -1,4 +1,10 @@
-use crate::board::{moves::{Move, MoveList, NULL_MOVE}, position::Position, types::Piece};
+use crate::board::{
+    attacks::attackers_to,
+    bitboard::pop_lsb,
+    moves::{Move, MoveList, NULL_MOVE},
+    position::Position,
+    types::Piece,
+};
 use crate::eval::evaluate;
 use crate::movegen::generate_legal_moves;
 use crate::tt::{TT, TT_EXACT, TT_LOWER, TT_UPPER};
@@ -9,6 +15,10 @@ pub const MATE_THRESHOLD: i32 = 29_000;
 const INF: i32 = 32_000;
 const MAX_PLY: usize = 128;
 
+// SEE piece values (approximate, for exchange evaluation)
+const SEE_VAL: [i32; 6] = [100, 300, 300, 500, 900, 20_000];
+
+// MVV-LVA for initial move ordering within winning captures
 const MVV: [i32; 6] = [100, 300, 300, 500, 900, 2000];
 const LVA: [i32; 6] = [6, 5, 4, 3, 2, 1];
 
@@ -16,6 +26,83 @@ const LVA: [i32; 6] = [6, 5, 4, 3, 2, 1];
 const RFP_MARGIN: [i32; 9] = [0, 80, 160, 240, 320, 400, 480, 560, 640];
 // Futility margins per depth
 const FP_MARGIN: [i32; 5] = [0, 100, 200, 300, 400];
+// Late move pruning: max quiet moves to try at each depth (non-PV, non-check)
+const LMP_MOVES: [usize; 5] = [0, 8, 12, 18, 24];
+
+/// Static exchange evaluation. Returns the expected material gain/loss
+/// from making `mv` on `pos`, assuming both sides recapture optimally.
+fn see(pos: &Position, mv: Move) -> i32 {
+    if mv.is_ep() { return 0; }
+    let to = mv.to();
+    let from = mv.from();
+
+    let captured_val = pos.piece_at(to)
+        .map(|(_, p)| SEE_VAL[p as usize])
+        .unwrap_or(0);
+    let (_, mover_piece) = match pos.piece_at(from) {
+        Some(x) => x,
+        None => return 0,
+    };
+
+    let mut attacker_val = if mv.is_promotion() {
+        SEE_VAL[Piece::Queen as usize]
+    } else {
+        SEE_VAL[mover_piece as usize]
+    };
+
+    let mut gain = [0i32; 32];
+    gain[0] = captured_val;
+    if mv.is_promotion() {
+        gain[0] += SEE_VAL[Piece::Queen as usize] - SEE_VAL[Piece::Pawn as usize];
+    }
+
+    // Track occupancy and per-color occupancy separately so captured pieces
+    // are excluded from subsequent attacker lookups.
+    let mut occ = (pos.occupancy[0] | pos.occupancy[1]) ^ (1u64 << from);
+    let mut by_color = [pos.occupancy[0], pos.occupancy[1]];
+    by_color[pos.side as usize] ^= 1u64 << from;
+
+    let mut stm = pos.side as usize ^ 1; // side making the recapture
+    let mut d = 1usize;
+
+    loop {
+        // Only consider pieces still on the board (& occ eliminates captured pieces
+        // even if pos.pieces still has them, since X-ray sliders use updated occ).
+        let all_attackers = attackers_to(to, occ, &pos.pieces) & occ;
+        let side_attackers = all_attackers & by_color[stm];
+        if side_attackers == 0 { break; }
+
+        // Least valuable attacker
+        let (lva_sq, lva_piece) = see_find_lva(side_attackers, &pos.pieces[stm]);
+        gain[d] = attacker_val - gain[d - 1];
+        attacker_val = SEE_VAL[lva_piece as usize];
+
+        // Remove the attacker; occ update reveals X-ray sliders automatically.
+        occ ^= 1u64 << lva_sq;
+        by_color[stm] ^= 1u64 << lva_sq;
+        stm ^= 1;
+        d += 1;
+        if d >= 32 { break; }
+    }
+
+    // Negamax: neither side is obligated to continue.
+    d -= 1;
+    while d > 0 {
+        gain[d - 1] = (-gain[d]).max(gain[d - 1]);
+        d -= 1;
+    }
+    gain[0]
+}
+
+fn see_find_lva(side_attackers: u64, pieces: &[u64; 6]) -> (u32, Piece) {
+    for (p, piece_bb) in pieces.iter().enumerate() {
+        let overlap = side_attackers & piece_bb;
+        if overlap != 0 {
+            return (overlap.trailing_zeros(), Piece::from_index(p));
+        }
+    }
+    (0, Piece::King)
+}
 
 pub struct SearchParams {
     pub start: Instant,
@@ -38,7 +125,11 @@ struct Search<'a> {
     nodes: u64,
     killers: [[Move; 2]; MAX_PLY],
     history: Box<[[i32; 64]; 64]>,
+    // Continuation history: [prev_from][prev_to][from][to] approximated as
+    // two separate 64x64 tables folded via XOR index to keep memory small
+    cont_hist: Box<[[i32; 64]; 64]>,
     pv_table: Vec<Vec<Move>>,
+    prev_move: [Move; MAX_PLY],
     stopped: bool,
 }
 
@@ -50,7 +141,9 @@ impl<'a> Search<'a> {
             nodes: 0,
             killers: [[NULL_MOVE; 2]; MAX_PLY],
             history: Box::new([[0i32; 64]; 64]),
+            cont_hist: Box::new([[0i32; 64]; 64]),
             pv_table: vec![Vec::new(); MAX_PLY + 1],
+            prev_move: [NULL_MOVE; MAX_PLY],
             stopped: false,
         }
     }
@@ -69,18 +162,34 @@ impl<'a> Search<'a> {
         }
     }
 
+    fn hist_score(&self, mv: Move, ply: usize) -> i32 {
+        let h = self.history[mv.from() as usize][mv.to() as usize];
+        let pm = self.prev_move[ply.saturating_sub(1)];
+        let ch = if !pm.is_null() {
+            self.cont_hist[pm.to() as usize][mv.to() as usize]
+        } else { 0 };
+        h + ch
+    }
+
     fn score_move(&self, pos: &Position, mv: Move, tt_move: Move, ply: usize) -> i32 {
         if mv == tt_move { return 10_000_000; }
         if mv.is_capture() || mv.is_ep() {
+            let see_score = see(pos, mv);
             let victim = if mv.is_ep() { 0 }
                 else { pos.piece_at(mv.to()).map(|(_, p)| p as usize).unwrap_or(0) };
             let attacker = pos.piece_at(mv.from()).map(|(_, p)| p as usize).unwrap_or(0);
-            return 1_000_000 + MVV[victim] - LVA[attacker];
+            let mvvlva = MVV[victim] - LVA[attacker];
+            // Winning/neutral captures first (2M+), losing captures last (negative range)
+            return if see_score >= 0 {
+                2_000_000 + mvvlva
+            } else {
+                -2_000_000 + mvvlva
+            };
         }
-        if mv.is_promotion() { return 900_000; }
+        if mv.is_promotion() { return 1_900_000; }
         if mv == self.killers[ply][0] { return 800_000; }
         if mv == self.killers[ply][1] { return 700_000; }
-        self.history[mv.from() as usize][mv.to() as usize]
+        self.hist_score(mv, ply)
     }
 
     fn order_moves(&self, pos: &Position, moves: &MoveList, tt_move: Move, ply: usize) -> Vec<Move> {
@@ -91,14 +200,27 @@ impl<'a> Search<'a> {
         scored.into_iter().map(|(_, mv)| mv).collect()
     }
 
+    fn update_history(&mut self, mv: Move, depth: i32, ply: usize, bonus: bool) {
+        let delta = if bonus { depth * depth } else { -(depth * depth) };
+        let h = &mut self.history[mv.from() as usize][mv.to() as usize];
+        *h += delta - *h * delta.abs() / 10_000;
+
+        let pm = self.prev_move[ply.saturating_sub(1)];
+        if !pm.is_null() {
+            let ch = &mut self.cont_hist[pm.to() as usize][mv.to() as usize];
+            *ch += delta - *ch * delta.abs() / 10_000;
+        }
+    }
+
     fn negamax(
         &mut self,
         pos: &mut Position,
         mut alpha: i32,
         beta: i32,
-        depth: i32,
+        mut depth: i32,
         ply: usize,
         skip_null: bool,
+        skip_move: Option<Move>, // for singular extensions
     ) -> i32 {
         self.pv_table[ply].clear();
         self.check_time();
@@ -115,13 +237,15 @@ impl<'a> Search<'a> {
 
         // TT probe
         let tt_move = if let Some(e) = self.tt.probe(pos.zobrist) {
-            if !is_root && !is_pv && e.depth >= depth as i8 {
+            if !is_root && skip_move.is_none() && e.depth >= depth as i8 {
                 let s = tt_score_from(e.score as i32, ply);
-                match e.flag {
-                    TT_EXACT => return s,
-                    TT_LOWER if s >= beta => return s,
-                    TT_UPPER if s <= alpha => return s,
-                    _ => {}
+                if !is_pv {
+                    match e.flag {
+                        TT_EXACT => return s,
+                        TT_LOWER if s >= beta => return s,
+                        TT_UPPER if s <= alpha => return s,
+                        _ => {}
+                    }
                 }
             }
             e.best_move
@@ -134,13 +258,19 @@ impl<'a> Search<'a> {
         }
 
         let in_check = pos.in_check();
-        let depth = if in_check { depth + 1 } else { depth };
+        // Check extension
+        if in_check { depth += 1; }
 
-        // Static evaluation for pruning decisions
+        // Internal iterative reduction: no TT move at high depths → search cheaper
+        if depth >= 4 && tt_move.is_null() && !in_check {
+            depth -= 1;
+        }
+
+        // Static evaluation for pruning decisions (skip if in check)
         let static_eval = if !in_check { evaluate(pos) } else { -INF };
 
-        // Reverse futility pruning (static null move)
-        if !is_pv && !in_check && depth <= 8 {
+        // Reverse futility pruning
+        if !is_pv && !in_check && depth <= 8 && skip_move.is_none() {
             let margin = RFP_MARGIN[depth as usize];
             if static_eval - margin >= beta {
                 return static_eval - margin;
@@ -153,14 +283,15 @@ impl<'a> Search<'a> {
             | pos.pieces[pos.side as usize][Piece::Rook as usize]
             | pos.pieces[pos.side as usize][Piece::Queen as usize] != 0;
 
-        if !is_pv && !in_check && !skip_null && depth >= 3 && has_non_pawns && static_eval >= beta {
-            let r = 2 + depth / 4;
+        if !is_pv && !in_check && !skip_null && depth >= 3 && has_non_pawns
+            && static_eval >= beta && skip_move.is_none()
+        {
+            let r = 3 + depth / 4;
             pos.make_null_move();
-            let null_score = -self.negamax(pos, -beta, -beta + 1, depth - 1 - r, ply + 1, true);
+            let null_score = -self.negamax(pos, -beta, -beta + 1, depth - 1 - r, ply + 1, true, None);
             pos.unmake_null_move();
             if self.stopped { return 0; }
             if null_score >= beta {
-                // Don't return unverified mate scores
                 if null_score >= MATE_THRESHOLD { return beta; }
                 return null_score;
             }
@@ -171,37 +302,96 @@ impl<'a> Search<'a> {
             return if in_check { -(MATE_SCORE - ply as i32) } else { 0 };
         }
 
+        // Singular extensions: if TT move exists and may be singular, verify
+        let singular_ext = if !is_root && !in_check && skip_move.is_none()
+            && depth >= 6 && !tt_move.is_null()
+            && {
+                let tt_ok = self.tt.probe(pos.zobrist)
+                    .map(|e| e.depth >= (depth - 3) as i8 && e.flag != TT_UPPER)
+                    .unwrap_or(false);
+                tt_ok
+            }
+        {
+            let tt_score = self.tt.probe(pos.zobrist)
+                .map(|e| tt_score_from(e.score as i32, ply))
+                .unwrap_or(0);
+            let s_beta = (tt_score - depth * 2).max(-MATE_SCORE);
+            let s_score = self.negamax(pos, s_beta - 1, s_beta, depth / 2, ply, skip_null, Some(tt_move));
+            if self.stopped { return 0; }
+            s_score < s_beta // singular if reduced search fails low
+        } else { false };
+
         let ordered = self.order_moves(pos, &moves, tt_move, ply);
         let orig_alpha = alpha;
         let mut best_score = -INF;
         let mut best_move = NULL_MOVE;
-        for (i, mv) in ordered.iter().enumerate() {
-            let is_quiet = !mv.is_capture() && !mv.is_ep() && !mv.is_promotion();
+        let mut quiets_tried = 0usize;
 
-            // Futility pruning: skip quiet moves at low depth when we're well below alpha
-            if !is_root && !in_check && is_quiet && depth <= 4 && i > 0 {
-                let margin = FP_MARGIN[depth as usize];
-                if static_eval + margin <= alpha {
+        for (i, mv) in ordered.iter().enumerate() {
+            // Skip the excluded move for singular extension search
+            if skip_move == Some(*mv) { continue; }
+
+            let is_quiet = !mv.is_capture() && !mv.is_ep() && !mv.is_promotion();
+            let is_capture = mv.is_capture() || mv.is_ep();
+            let see_score = if is_capture { see(pos, *mv) } else { 0 };
+
+            // --- Pruning (not at root, not in check) ---
+            if !is_root && !in_check && best_score > -MATE_THRESHOLD {
+
+                // Futility pruning: quiet moves at low depth when well below alpha
+                if is_quiet && depth <= 4 && i > 0 {
+                    let margin = FP_MARGIN[depth as usize];
+                    if static_eval + margin <= alpha { continue; }
+                }
+
+                // Late move pruning: skip quiet moves beyond threshold
+                if is_quiet && depth <= 4 && quiets_tried >= LMP_MOVES[depth as usize] {
                     continue;
+                }
+
+                // History pruning: skip quiet moves with very negative history
+                if is_quiet && depth <= 3 {
+                    let hs = self.hist_score(*mv, ply);
+                    if hs < -2000 * depth { continue; }
+                }
+
+                // SEE pruning: skip bad captures and bad quiet moves at low depth
+                if depth <= 6 {
+                    if is_capture && see_score < -50 * depth { continue; }
+                    if is_quiet && see_score < -50 * depth { continue; }
                 }
             }
 
+            if is_quiet { quiets_tried += 1; }
+
+            // Extensions
+            let ext = if singular_ext && *mv == tt_move { 1 }
+                      else { 0 };
+
             pos.make_move(*mv);
             self.nodes += 1;
+            self.prev_move[ply] = *mv;
 
             let score = if i == 0 {
-                -self.negamax(pos, -beta, -alpha, depth - 1, ply + 1, false)
+                -self.negamax(pos, -beta, -alpha, depth - 1 + ext, ply + 1, false, None)
             } else {
                 // Late-move reductions
-                let r = if is_quiet && depth >= 3 && i >= 4 {
-                    let reduction = 1 + (i as i32).ilog2() as i32;
-                    reduction.min(depth - 1)
+                let mut r = if is_quiet && depth >= 3 && i >= 3 {
+                    // Base reduction from log table
+                    let base = ((depth as f32).ln() * (i as f32).ln() / 2.0) as i32;
+                    // Adjust by history: good history → less reduction
+                    let hs = self.hist_score(*mv, ply);
+                    let hist_adj = (hs / 4000).clamp(-2, 2);
+                    (base - hist_adj).max(0).min(depth - 1)
                 } else { 0 };
 
-                // Search with null window first
-                let zw = -self.negamax(pos, -alpha - 1, -alpha, depth - 1 - r, ply + 1, false);
+                // Don't reduce good captures or moves with singular extensions
+                if is_capture && see_score >= 0 { r = 0; }
+                if ext > 0 { r = 0; }
+
+                let zw = -self.negamax(pos, -alpha - 1, -alpha, depth - 1 - r + ext, ply + 1, false, None);
                 if zw > alpha && (zw < beta || r > 0) {
-                    -self.negamax(pos, -beta, -alpha, depth - 1, ply + 1, false)
+                    -self.negamax(pos, -beta, -alpha, depth - 1 + ext, ply + 1, false, None)
                 } else { zw }
             };
 
@@ -224,8 +414,13 @@ impl<'a> Search<'a> {
                 if is_quiet {
                     self.killers[ply][1] = self.killers[ply][0];
                     self.killers[ply][0] = *mv;
-                    let h = &mut self.history[mv.from() as usize][mv.to() as usize];
-                    *h = (*h + depth * depth).min(10_000);
+                    self.update_history(*mv, depth, ply, true);
+                    // Penalize quiets that were tried and failed
+                    for &tried in ordered[..i].iter() {
+                        if !tried.is_capture() && !tried.is_ep() && !tried.is_promotion() {
+                            self.update_history(tried, depth, ply, false);
+                        }
+                    }
                 }
                 break;
             }
@@ -234,7 +429,9 @@ impl<'a> Search<'a> {
         let flag = if best_score <= orig_alpha { TT_UPPER }
                    else if best_score >= beta { TT_LOWER }
                    else { TT_EXACT };
-        self.tt.store(pos.zobrist, tt_score_to(best_score, ply) as i16, depth as i8, flag, best_move);
+        if skip_move.is_none() {
+            self.tt.store(pos.zobrist, tt_score_to(best_score, ply) as i16, depth as i8, flag, best_move);
+        }
 
         best_score
     }
@@ -247,8 +444,8 @@ impl<'a> Search<'a> {
         let stand_pat = evaluate(pos);
         if stand_pat >= beta { return stand_pat; }
 
-        // Delta pruning: if even capturing a queen can't raise alpha, skip
-        const DELTA: i32 = 1025 + 200; // queen value + safety margin
+        // Delta pruning
+        const DELTA: i32 = 1025 + 200;
         if stand_pat + DELTA < alpha { return alpha; }
 
         if stand_pat > alpha { alpha = stand_pat; }
@@ -256,7 +453,9 @@ impl<'a> Search<'a> {
         let moves = generate_legal_moves(pos);
         let ordered = self.order_moves(pos, &moves, NULL_MOVE, ply.min(MAX_PLY - 1));
         for mv in &ordered {
-            if !mv.is_capture() && !mv.is_ep() && !mv.is_promotion() { break; } // sorted, quiet at end
+            if !mv.is_capture() && !mv.is_ep() && !mv.is_promotion() { break; }
+            // Skip bad captures (SEE < 0) in qsearch
+            if see(pos, *mv) < 0 { continue; }
             pos.make_move(*mv);
             let score = -self.quiesce(pos, -beta, -alpha, ply + 1);
             pos.unmake_move(*mv);
@@ -267,9 +466,11 @@ impl<'a> Search<'a> {
         alpha
     }
 
-    /// Age history scores to prevent stale data from dominating.
     fn age_history(&mut self) {
         for row in self.history.iter_mut() {
+            for v in row.iter_mut() { *v /= 2; }
+        }
+        for row in self.cont_hist.iter_mut() {
             for v in row.iter_mut() { *v /= 2; }
         }
     }
@@ -296,22 +497,22 @@ pub fn search(pos: &mut Position, params: &SearchParams, tt: &mut TT) -> SearchR
     for depth in 1..=max_depth {
         searcher.age_history();
 
-        // Aspiration windows (skip at low depths where they're not reliable)
         let score = if depth <= 4 {
-            searcher.negamax(pos, -INF, INF, depth, 0, false)
+            searcher.negamax(pos, -INF, INF, depth, 0, false, None)
         } else {
-            let mut delta = 50i32;
+            let mut delta = 25i32;
             let mut alpha = (prev_score - delta).max(-INF);
             let mut beta = (prev_score + delta).min(INF);
             loop {
-                let s = searcher.negamax(pos, alpha, beta, depth, 0, false);
+                let s = searcher.negamax(pos, alpha, beta, depth, 0, false, None);
                 if searcher.stopped { break s; }
                 if s <= alpha {
                     alpha = (alpha - delta).max(-INF);
-                    delta *= 2;
+                    beta = (alpha + beta) / 2 + 1; // widen symmetrically
+                    delta = (delta * 3 / 2).min(INF);
                 } else if s >= beta {
                     beta = (beta + delta).min(INF);
-                    delta *= 2;
+                    delta = (delta * 3 / 2).min(INF);
                 } else {
                     break s;
                 }

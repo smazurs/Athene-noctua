@@ -66,6 +66,17 @@ impl Piece {
             _ => None,
         }
     }
+
+    pub fn from_index(i: usize) -> Piece {
+        match i {
+            0 => Piece::Pawn,
+            1 => Piece::Knight,
+            2 => Piece::Bishop,
+            3 => Piece::Rook,
+            4 => Piece::Queen,
+            _ => Piece::King,
+        }
+    }
 }
 
 /// Castling rights bitmask: WK=1, WQ=2, BK=4, BQ=8.
