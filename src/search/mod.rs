@@ -28,6 +28,9 @@ const FP_MARGIN: [i32; 5] = [0, 100, 200, 300, 400];
 const LMP_IMPROVING:     [usize; 5] = [0, 10, 16, 24, 32];
 const LMP_NOT_IMPROVING: [usize; 5] = [0,  5,  9, 14, 19];
 const PROBCUT_MARGIN: i32 = 150;
+const CORRHIST_SIZE: usize = 16384;
+const CORRHIST_GRAIN: i32 = 256;
+const CORRHIST_MAX: i32 = 1024 * CORRHIST_GRAIN;
 
 /// Static exchange evaluation. Returns the expected material gain/loss
 /// from making `mv` on `pos`, assuming both sides recapture optimally.
@@ -137,6 +140,10 @@ struct Search<'a> {
     pv_table: Vec<Vec<Move>>,
     prev_move: [Move; MAX_PLY],
     stopped: bool,
+    corrhist: Box<[[i32; CORRHIST_SIZE]; 2]>,
+    cont_hist2: Box<[[i32; 64]; 64]>,
+    root_best_nodes: u64,
+    root_total_nodes: u64,
 }
 
 impl<'a> Search<'a> {
@@ -162,6 +169,10 @@ impl<'a> Search<'a> {
             pv_table: vec![Vec::new(); MAX_PLY + 1],
             prev_move: [NULL_MOVE; MAX_PLY],
             stopped: false,
+            corrhist: Box::new([[0i32; CORRHIST_SIZE]; 2]),
+            cont_hist2: Box::new([[0i32; 64]; 64]),
+            root_best_nodes: 0,
+            root_total_nodes: 0,
         }
     }
 
@@ -179,13 +190,35 @@ impl<'a> Search<'a> {
         }
     }
 
+    fn corrected_static_eval(&self, pos: &Position) -> i32 {
+        let raw = evaluate(pos);
+        let idx = pos.pawn_zobrist as usize % CORRHIST_SIZE;
+        let corr = self.corrhist[pos.side as usize][idx] / CORRHIST_GRAIN;
+        (raw + corr).clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
+    }
+
+    fn update_corrhist(&mut self, pos: &Position, depth: i32, best_score: i32, raw_eval: i32) {
+        if best_score.abs() >= MATE_THRESHOLD || raw_eval.abs() >= MATE_THRESHOLD { return; }
+        let delta = best_score - raw_eval;
+        let weight = (depth + 1).min(8);
+        let idx = pos.pawn_zobrist as usize % CORRHIST_SIZE;
+        let h = &mut self.corrhist[pos.side as usize][idx];
+        let update = delta * CORRHIST_GRAIN * weight;
+        *h += (update - *h * update.abs() / CORRHIST_MAX) / 8;
+        *h = (*h).clamp(-CORRHIST_MAX, CORRHIST_MAX);
+    }
+
     fn hist_score(&self, mv: Move, ply: usize) -> i32 {
         let h = self.history[mv.from() as usize][mv.to() as usize];
         let pm = self.prev_move[ply.saturating_sub(1)];
         let ch = if !pm.is_null() {
             self.cont_hist[pm.to() as usize][mv.to() as usize]
         } else { 0 };
-        h + ch
+        let pm2 = if ply >= 2 { self.prev_move[ply - 2] } else { NULL_MOVE };
+        let ch2 = if !pm2.is_null() {
+            self.cont_hist2[pm2.to() as usize][mv.to() as usize]
+        } else { 0 };
+        h + ch + ch2
     }
 
     fn score_move(&self, pos: &Position, mv: Move, tt_move: Move, ply: usize) -> i32 {
@@ -231,6 +264,12 @@ impl<'a> Search<'a> {
         if !pm.is_null() {
             let ch = &mut self.cont_hist[pm.to() as usize][mv.to() as usize];
             *ch += delta - *ch * delta.abs() / 10_000;
+        }
+
+        let pm2 = if ply >= 2 { self.prev_move[ply - 2] } else { NULL_MOVE };
+        if !pm2.is_null() {
+            let ch2 = &mut self.cont_hist2[pm2.to() as usize][mv.to() as usize];
+            *ch2 += delta - *ch2 * delta.abs() / 10_000;
         }
     }
 
@@ -295,7 +334,12 @@ impl<'a> Search<'a> {
         }
 
         // Static evaluation + improving flag
-        let static_eval = if !in_check { evaluate(pos) } else { -INF };
+        let raw_eval = if !in_check { evaluate(pos) } else { -INF };
+        let static_eval = if !in_check {
+            let idx = pos.pawn_zobrist as usize % CORRHIST_SIZE;
+            let corr = self.corrhist[pos.side as usize][idx] / CORRHIST_GRAIN;
+            (raw_eval + corr).clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
+        } else { -INF };
         self.eval_stack[ply] = static_eval;
         let improving = !in_check && ply >= 2 && static_eval > self.eval_stack[ply - 2];
 
@@ -436,6 +480,7 @@ impl<'a> Search<'a> {
             } else if is_recapture && depth <= 7 { 1 }
             else { 0 };
 
+            let nodes_before = if is_root { self.nodes } else { 0 };
             pos.make_move(*mv);
             self.nodes += 1;
             self.prev_move[ply] = *mv;
@@ -465,6 +510,14 @@ impl<'a> Search<'a> {
 
             pos.unmake_move(*mv);
             if self.stopped { return 0; }
+
+            if is_root {
+                let mv_nodes = self.nodes - nodes_before;
+                self.root_total_nodes += mv_nodes;
+                if score > best_score {
+                    self.root_best_nodes = mv_nodes;
+                }
+            }
 
             if score > best_score {
                 best_score = score;
@@ -510,6 +563,9 @@ impl<'a> Search<'a> {
                    else { TT_EXACT };
         if skip_move.is_none() {
             self.tt.store(pos.zobrist, tt_score_to(best_score, ply) as i16, depth as i8, flag, best_move);
+            if !in_check && !self.stopped && depth >= 1 {
+                self.update_corrhist(pos, depth, best_score, raw_eval);
+            }
         }
 
         best_score
@@ -588,6 +644,7 @@ impl<'a> Search<'a> {
     fn age_history(&mut self) {
         for row in self.history.iter_mut() { for v in row.iter_mut() { *v /= 2; } }
         for row in self.cont_hist.iter_mut() { for v in row.iter_mut() { *v /= 2; } }
+        for row in self.cont_hist2.iter_mut() { for v in row.iter_mut() { *v /= 2; } }
         for row in self.cap_hist.iter_mut() { for v in row.iter_mut() { *v /= 2; } }
     }
 }
@@ -675,20 +732,27 @@ pub fn search(pos: &mut Position, params: &SearchParams, tt: &mut TT) -> SearchR
 
         if score.abs() > MATE_THRESHOLD { break; }
         if let Some(soft) = params.soft_limit {
-            // Stability scaling: use less time when best move is stable
             let stability_scale = match stability {
-                0 => 160u64,  // just changed: use 60% more time
+                0 => 160u64,
                 1 => 120,
                 2 => 100,
                 3 => 85,
-                _ => 70,      // very stable: save 30%
+                _ => 70,
             };
-            // Score-drop scaling: use more time when score dropped significantly
             let drop_scale = if score_drop > 60 { 160u64 }
                              else if score_drop > 30 { 130u64 }
                              else { 100u64 };
-            // Combined scale (product, normalized so 100*100 = 100%)
-            let combined = stability_scale * drop_scale / 100;
+            // Node-based scaling: if best move consumed most nodes, we're confident
+            let node_scale = if searcher.root_total_nodes > 0 {
+                let frac = searcher.root_best_nodes * 100 / searcher.root_total_nodes;
+                if frac > 80 { 60u64 } else if frac > 60 { 80u64 }
+                else if frac < 20 { 150u64 } else if frac < 40 { 120u64 }
+                else { 100u64 }
+            } else { 100u64 };
+            // Reset root node counters for next iteration
+            searcher.root_best_nodes = 0;
+            searcher.root_total_nodes = 0;
+            let combined = (stability_scale * drop_scale / 100 * node_scale / 100).clamp(40, 280);
             if searcher.elapsed_ms() * 100 >= soft * combined { break; }
         }
     }
