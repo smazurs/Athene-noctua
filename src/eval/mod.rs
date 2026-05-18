@@ -156,6 +156,16 @@ const OUTPOST_EG: [i32; 2] = [12, 6];
 const CONNECTED_ROOKS_MG: i32 = 10;
 const CONNECTED_ROOKS_EG: i32 = 5;
 
+// ── Backward pawn penalties ───────────────────────────────────────────────────
+const BACKWARD_MG: i32 = 12;
+const BACKWARD_EG: i32 = 15;
+
+// ── Bad bishop (own pawns on same color as bishop) ────────────────────────────
+// Light squares: (rank+file) odd; dark squares: (rank+file) even
+const LIGHT_SQUARES: u64 = 0xAA55AA55AA55AA55;
+const DARK_SQUARES:  u64 = 0x55AA55AA55AA55AA;
+const BAD_BISHOP_EG: i32 = 4;  // penalty per own pawn on same color as bishop
+
 // ── Tempo bonus (side to move small advantage) ────────────────────────────────
 const TEMPO: i32 = 15;
 
@@ -180,6 +190,24 @@ fn pawn_attack_bb(pawns: u64, color: usize) -> u64 {
     }
 }
 
+fn backward_support_mask_white(sq: u32) -> u64 {
+    let file = file_of(sq);
+    let rank = rank_of(sq);
+    let adj = if file > 0 { FILE_A << (file - 1) } else { 0 }
+            | if file < 7 { FILE_A << (file + 1) } else { 0 };
+    let rank_mask = (1u64 << ((rank + 1) * 8)).wrapping_sub(1);
+    adj & rank_mask
+}
+
+fn backward_support_mask_black(sq: u32) -> u64 {
+    let file = file_of(sq);
+    let rank = rank_of(sq);
+    let adj = if file > 0 { FILE_A << (file - 1) } else { 0 }
+            | if file < 7 { FILE_A << (file + 1) } else { 0 };
+    let rank_mask = !0u64 << (rank * 8);
+    adj & rank_mask
+}
+
 fn passed_mask_white(sq: u32) -> u64 {
     let file = file_of(sq);
     let mut files = FILE_A << file;
@@ -193,6 +221,9 @@ fn eval_pawns(pos: &Position) -> (i32, i32) {
     let bp = pos.pieces[1][Piece::Pawn as usize];
     let mut mg = 0i32; let mut eg = 0i32;
 
+    let wp_attacks = pawn_attack_bb(wp, 0);
+    let bp_attacks = pawn_attack_bb(bp, 1);
+
     let mut bb = wp;
     while bb != 0 {
         let sq = pop_lsb(&mut bb);
@@ -204,6 +235,13 @@ fn eval_pawns(pos: &Position) -> (i32, i32) {
         let adj = if file > 0 { FILE_A << (file - 1) } else { 0 }
                 | if file < 7 { FILE_A << (file + 1) } else { 0 };
         if wp & adj == 0 { mg -= ISOLATED_MG; eg -= ISOLATED_EG; }
+        // Backward pawn: square in front attacked by black pawn, no supporting pawn behind
+        if sq < 56 {
+            let stop = 1u64 << (sq + 8);
+            if bp_attacks & stop != 0 && wp & backward_support_mask_white(sq) == 0 {
+                mg -= BACKWARD_MG; eg -= BACKWARD_EG;
+            }
+        }
     }
 
     let mut bb = bp;
@@ -217,6 +255,13 @@ fn eval_pawns(pos: &Position) -> (i32, i32) {
         let adj = if file > 0 { FILE_A << (file - 1) } else { 0 }
                 | if file < 7 { FILE_A << (file + 1) } else { 0 };
         if bp & adj == 0 { mg += ISOLATED_MG; eg += ISOLATED_EG; }
+        // Backward pawn for black
+        if sq >= 8 {
+            let stop = 1u64 << (sq - 8);
+            if wp_attacks & stop != 0 && bp & backward_support_mask_black(sq) == 0 {
+                mg += BACKWARD_MG; eg += BACKWARD_EG;
+            }
+        }
     }
     (mg, eg)
 }
@@ -504,6 +549,21 @@ pub fn evaluate(pos: &Position) -> i32 {
         let sign = if color == 0 { 1i32 } else { -1 };
         if pos.pieces[color][Piece::Bishop as usize].count_ones() >= 2 {
             mg += sign * BISHOP_PAIR_MG; eg += sign * BISHOP_PAIR_EG;
+        }
+    }
+
+    // Bad bishop: penalty per own pawn on same color as bishop (endgame term)
+    for color in 0..2usize {
+        let sign = if color == 0 { 1i32 } else { -1 };
+        let bishops = pos.pieces[color][Piece::Bishop as usize];
+        let pawns = pos.pieces[color][Piece::Pawn as usize];
+        if bishops & LIGHT_SQUARES != 0 {
+            let cnt = (pawns & LIGHT_SQUARES).count_ones() as i32;
+            eg -= sign * cnt * BAD_BISHOP_EG;
+        }
+        if bishops & DARK_SQUARES != 0 {
+            let cnt = (pawns & DARK_SQUARES).count_ones() as i32;
+            eg -= sign * cnt * BAD_BISHOP_EG;
         }
     }
 
