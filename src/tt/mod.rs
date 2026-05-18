@@ -53,4 +53,11 @@ impl TT {
     pub fn clear(&mut self) {
         self.table.iter_mut().for_each(|e| *e = TTEntry::default());
     }
+
+    /// Approximate fill rate in per-mille (0–1000), sampling 1024 entries.
+    pub fn hashfull(&self) -> u32 {
+        let n = self.table.len().min(1024);
+        let used = self.table[..n].iter().filter(|e| e.flag != TT_NONE).count();
+        (used * 1000 / n) as u32
+    }
 }
