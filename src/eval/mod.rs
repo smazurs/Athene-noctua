@@ -5,36 +5,6 @@ use crate::board::{
     types::{file_of, rank_of, Color, Piece},
 };
 
-// ── Pawn hash table ───────────────────────────────────────────────────────────
-const PAWN_TT_SIZE: usize = 16384;
-
-#[derive(Clone, Copy, Default)]
-pub struct PawnEntry {
-    key: u64,
-    mg: i32,
-    eg: i32,
-}
-
-pub struct PawnTable {
-    entries: Box<[PawnEntry; PAWN_TT_SIZE]>,
-}
-
-impl PawnTable {
-    pub fn new() -> Self {
-        PawnTable { entries: Box::new([PawnEntry::default(); PAWN_TT_SIZE]) }
-    }
-
-    fn probe(&self, key: u64) -> Option<(i32, i32)> {
-        let e = &self.entries[key as usize % PAWN_TT_SIZE];
-        if e.key == key { Some((e.mg, e.eg)) } else { None }
-    }
-
-    fn store(&mut self, key: u64, mg: i32, eg: i32) {
-        let e = &mut self.entries[key as usize % PAWN_TT_SIZE];
-        *e = PawnEntry { key, mg, eg };
-    }
-}
-
 // ── Material values ──────────────────────────────────────────────────────────
 const MG_MAT: [i32; 6] = [82, 337, 365, 477, 1025, 0];
 const EG_MAT: [i32; 6] = [94, 281, 297, 512, 936, 0];
@@ -684,139 +654,6 @@ fn eval_connected_passers(pos: &Position) -> (i32, i32) {
     (mg, eg)
 }
 
-/// Penalty for a king stuck in the center (files c–f) based on open files nearby.
-fn eval_center_king(pos: &Position, phase: i32) -> i32 {
-    if phase < 6 { return 0; }
-    let mut score = 0i32;
-    for color in 0..2usize {
-        let sign = if color == 0 { 1i32 } else { -1 };
-        let king_sq = pos.king_sq(if color == 0 { Color::White } else { Color::Black });
-        let kfile = file_of(king_sq) as i32;
-        if kfile < 2 || kfile > 5 { continue; } // not in center
-        let own_pawns = pos.pieces[color][Piece::Pawn as usize];
-        let opp_pawns = pos.pieces[color ^ 1][Piece::Pawn as usize];
-        let mut penalty = 20i32; // base penalty for center king
-        for df in -1i32..=1 {
-            let f = kfile + df;
-            if f < 0 || f > 7 { continue; }
-            let fmask = FILE_A << f as u32;
-            penalty += match (own_pawns & fmask != 0, opp_pawns & fmask != 0) {
-                (false, false) => 25, // fully open file
-                (false, true)  => 12, // semi-open
-                _              =>  0,
-            };
-        }
-        score -= sign * penalty * phase / TOTAL_PHASE;
-    }
-    score
-}
-
-/// Fast material + PST only evaluation (no mobility/king safety).
-/// Used for lazy evaluation shortcut in the search.
-pub fn evaluate_quick(pos: &Position) -> i32 {
-    let mut mg = 0i32; let mut eg = 0i32; let mut phase = 0i32;
-    for color in 0..2usize {
-        let sign = if color == 0 { 1i32 } else { -1 };
-        for piece in 0..6usize {
-            let mut bb = pos.pieces[color][piece];
-            while bb != 0 {
-                let sq = pop_lsb(&mut bb) as usize;
-                let pst_sq = if color == 0 { sq } else { sq ^ 56 };
-                mg += sign * (MG_MAT[piece] + MG_PST[piece][pst_sq]);
-                eg += sign * (EG_MAT[piece] + EG_PST[piece][pst_sq]);
-                phase += PHASE_INC[piece];
-            }
-        }
-    }
-    let phase = phase.min(TOTAL_PHASE);
-    let score = (mg * phase + eg * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
-    let raw = if pos.side == Color::White { score } else { -score };
-    raw + TEMPO
-}
-
-/// Full evaluation using a pawn hash table to cache pawn structure eval.
-pub fn evaluate_with_ptable(pos: &Position, ptable: &mut PawnTable) -> i32 {
-    let mut mg = 0i32; let mut eg = 0i32; let mut phase = 0i32;
-    let occ = pos.occupancy[0] | pos.occupancy[1];
-
-    for color in 0..2usize {
-        let sign = if color == 0 { 1i32 } else { -1 };
-        for piece in 0..6usize {
-            let mut bb = pos.pieces[color][piece];
-            while bb != 0 {
-                let sq = pop_lsb(&mut bb) as usize;
-                let pst_sq = if color == 0 { sq } else { sq ^ 56 };
-                mg += sign * (MG_MAT[piece] + MG_PST[piece][pst_sq]);
-                eg += sign * (EG_MAT[piece] + EG_PST[piece][pst_sq]);
-                phase += PHASE_INC[piece];
-            }
-        }
-    }
-
-    for color in 0..2usize {
-        let sign = if color == 0 { 1i32 } else { -1 };
-        if pos.pieces[color][Piece::Bishop as usize].count_ones() >= 2 {
-            mg += sign * BISHOP_PAIR_MG; eg += sign * BISHOP_PAIR_EG;
-        }
-    }
-
-    // Pawn eval — use cache
-    let (pmg, peg) = if let Some((m, e)) = ptable.probe(pos.pawn_zobrist) {
-        (m, e)
-    } else {
-        let (m, e) = eval_pawns(pos);
-        ptable.store(pos.pawn_zobrist, m, e);
-        (m, e)
-    };
-    mg += pmg; eg += peg;
-
-    let (rmg, reg) = eval_rooks(pos);
-    mg += rmg; eg += reg;
-
-    phase = phase.min(TOTAL_PHASE);
-
-    let (mmg, meg) = eval_mobility(pos, occ);
-    mg += mmg; eg += meg;
-
-    let (tmg, teg) = eval_threats(pos);
-    mg += tmg; eg += teg;
-
-    let (omg, oeg) = eval_outposts(pos);
-    mg += omg; eg += oeg;
-
-    let (crmg, creg) = eval_connected_rooks(pos, occ);
-    mg += crmg; eg += creg;
-
-    let (ttmg, tteg) = eval_tarrasch(pos);
-    mg += ttmg; eg += tteg;
-
-    let (cpmg, cpeg) = eval_connected_passers(pos);
-    mg += cpmg; eg += cpeg;
-
-    mg += eval_king_safety(pos, occ, phase);
-    mg += eval_space(pos, phase);
-
-    // Bad bishop
-    for color in 0..2usize {
-        let sign = if color == 0 { 1i32 } else { -1 };
-        let bishops = pos.pieces[color][Piece::Bishop as usize];
-        let pawns = pos.pieces[color][Piece::Pawn as usize];
-        if bishops & LIGHT_SQUARES != 0 {
-            eg -= sign * (pawns & LIGHT_SQUARES).count_ones() as i32 * BAD_BISHOP_EG;
-        }
-        if bishops & DARK_SQUARES != 0 {
-            eg -= sign * (pawns & DARK_SQUARES).count_ones() as i32 * BAD_BISHOP_EG;
-        }
-    }
-
-    let score = (mg * phase + eg * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
-    let prox = eval_king_proximity(pos, phase);
-    let center_pen = eval_center_king(pos, phase);
-    let raw = if pos.side == Color::White { score + prox + center_pen }
-              else { -score - prox - center_pen };
-    raw + TEMPO
-}
-
 pub fn evaluate(pos: &Position) -> i32 {
     let mut mg = 0i32; let mut eg = 0i32; let mut phase = 0i32;
     let occ = pos.occupancy[0] | pos.occupancy[1];
@@ -891,9 +728,7 @@ pub fn evaluate(pos: &Position) -> i32 {
 
     // King proximity is purely an endgame term
     let prox = eval_king_proximity(pos, phase);
-    let center_pen = eval_center_king(pos, phase);
-    let raw = if pos.side == Color::White { score + prox + center_pen }
-              else { -score - prox - center_pen };
+    let raw = if pos.side == Color::White { score + prox } else { -score - prox };
 
     // Tempo: small bonus for the side to move
     raw + TEMPO
