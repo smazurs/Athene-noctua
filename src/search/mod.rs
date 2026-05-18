@@ -427,9 +427,14 @@ impl<'a> Search<'a> {
             if is_quiet { quiets_tried += 1; }
 
             // Extensions
+            let pm = self.prev_move[ply.saturating_sub(1)];
+            let is_recapture = is_capture && !pm.is_null()
+                && (pm.is_capture() || pm.is_ep()) && pm.to() == mv.to()
+                && see_score >= 0;
             let ext = if singular_ext && *mv == tt_move {
                 if double_ext { 2 } else { 1 }
-            } else { 0 };
+            } else if is_recapture && depth <= 7 { 1 }
+            else { 0 };
 
             pos.make_move(*mv);
             self.nodes += 1;
@@ -515,29 +520,69 @@ impl<'a> Search<'a> {
         if self.stopped { return 0; }
         self.nodes += 1;
 
-        let stand_pat = evaluate(pos);
-        if stand_pat >= beta { return stand_pat; }
+        let in_check = pos.in_check();
 
-        // Delta pruning
-        const DELTA: i32 = 1025 + 200;
-        if stand_pat + DELTA < alpha { return alpha; }
+        // TT probe in qsearch
+        let tt_move = if let Some(e) = self.tt.probe(pos.zobrist) {
+            let s = tt_score_from(e.score as i32, ply);
+            if e.depth >= 0 {
+                match e.flag {
+                    TT_EXACT => return s,
+                    TT_LOWER if s >= beta => return s,
+                    TT_UPPER if s <= alpha => return s,
+                    _ => {}
+                }
+            }
+            e.best_move
+        } else { NULL_MOVE };
 
-        if stand_pat > alpha { alpha = stand_pat; }
+        let stand_pat = if !in_check {
+            let sp = evaluate(pos);
+            if sp >= beta { return sp; }
+            // Delta pruning
+            const DELTA: i32 = 1025 + 200;
+            if sp + DELTA < alpha { return alpha; }
+            if sp > alpha { alpha = sp; }
+            sp
+        } else { -INF };
 
         let moves = generate_legal_moves(pos);
-        let ordered = self.order_moves(pos, &moves, NULL_MOVE, ply.min(MAX_PLY - 1));
+        // In check with no moves = checkmate
+        if in_check && moves.len == 0 {
+            return -(MATE_SCORE - ply as i32);
+        }
+
+        let ordered = self.order_moves(pos, &moves, tt_move, ply.min(MAX_PLY - 1));
+        let orig_alpha = alpha;
+        let mut best_score = if in_check { -INF } else { stand_pat };
+        let mut best_move = NULL_MOVE;
+
         for mv in &ordered {
-            if !mv.is_capture() && !mv.is_ep() && !mv.is_promotion() { break; }
-            // Skip bad captures (SEE < 0) in qsearch
-            if see(pos, *mv) < 0 { continue; }
+            // When not in check: only captures, EP, promotions (sorted, quiets break early)
+            if !in_check && !mv.is_capture() && !mv.is_ep() && !mv.is_promotion() { break; }
+            // Skip bad captures (SEE < 0) when not in check
+            if !in_check && see(pos, *mv) < 0 { continue; }
             pos.make_move(*mv);
             let score = -self.quiesce(pos, -beta, -alpha, ply + 1);
             pos.unmake_move(*mv);
             if self.stopped { return 0; }
-            if score >= beta { return score; }
-            if score > alpha { alpha = score; }
+            if score > best_score {
+                best_score = score;
+                best_move = *mv;
+                if score > alpha {
+                    alpha = score;
+                    if score >= beta {
+                        self.tt.store(pos.zobrist, tt_score_to(score, ply) as i16,
+                            0, TT_LOWER, best_move);
+                        return score;
+                    }
+                }
+            }
         }
-        alpha
+
+        let flag = if best_score <= orig_alpha { TT_UPPER } else { TT_EXACT };
+        self.tt.store(pos.zobrist, tt_score_to(best_score, ply) as i16, 0, flag, best_move);
+        best_score
     }
 
     fn age_history(&mut self) {
