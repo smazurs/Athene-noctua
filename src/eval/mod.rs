@@ -166,6 +166,20 @@ const LIGHT_SQUARES: u64 = 0xAA55AA55AA55AA55;
 const DARK_SQUARES:  u64 = 0x55AA55AA55AA55AA;
 const BAD_BISHOP_EG: i32 = 4;  // penalty per own pawn on same color as bishop
 
+// ── Space evaluation ──────────────────────────────────────────────────────────
+// Safe center squares (files c-f) in own forward area, MG only
+const SPACE_BONUS_MG: i32 = 2;  // per safe center square
+
+// ── Tarrasch rule (rook/queen behind passed pawn) ─────────────────────────────
+const TARRASCH_OWN_MG: i32 = 15;
+const TARRASCH_OWN_EG: i32 = 25;
+const TARRASCH_ENEMY_MG: i32 = 8;
+const TARRASCH_ENEMY_EG: i32 = 15;
+
+// ── Connected passed pawns bonus ──────────────────────────────────────────────
+const CONNECTED_PASSERS_MG: i32 = 18;
+const CONNECTED_PASSERS_EG: i32 = 30;
+
 // ── Tempo bonus (side to move small advantage) ────────────────────────────────
 const TEMPO: i32 = 15;
 
@@ -527,6 +541,119 @@ fn eval_king_proximity(pos: &Position, phase: i32) -> i32 {
     score * eg_frac / TOTAL_PHASE
 }
 
+/// Space: count safe squares (not attacked by enemy pawns) in center files c-f
+/// on ranks 2-4 for white (bits 8-31) and ranks 5-7 for black (bits 32-55).
+fn eval_space(pos: &Position, phase: i32) -> i32 {
+    if phase < 4 { return 0; }
+    const CENTER_FILES: u64 = 0x3C3C3C3C3C3C3C3Cu64; // files c-f (bits 2,3,4,5 per rank)
+    const WHITE_AREA: u64  = 0x0000_0000_FFFF_FF00u64; // ranks 2-4
+    const BLACK_AREA: u64  = 0x00FF_FFFF_0000_0000u64; // ranks 5-7
+
+    let bp_attacks = pawn_attack_bb(pos.pieces[1][Piece::Pawn as usize], 1);
+    let wp_attacks = pawn_attack_bb(pos.pieces[0][Piece::Pawn as usize], 0);
+
+    let w_space = (CENTER_FILES & WHITE_AREA & !bp_attacks).count_ones() as i32;
+    let b_space = (CENTER_FILES & BLACK_AREA & !wp_attacks).count_ones() as i32;
+
+    (w_space - b_space) * SPACE_BONUS_MG * phase / TOTAL_PHASE
+}
+
+/// Tarrasch rule: rooks and queens score a bonus when placed behind own passed
+/// pawns, and when restraining enemy passed pawns from behind.
+fn eval_tarrasch(pos: &Position) -> (i32, i32) {
+    let mut mg = 0i32; let mut eg = 0i32;
+    let wp = pos.pieces[0][Piece::Pawn as usize];
+    let bp = pos.pieces[1][Piece::Pawn as usize];
+
+    // Identify passed pawns
+    let mut white_passers = 0u64;
+    {
+        let mut bb = wp;
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            if bp & passed_mask_white(sq) == 0 { white_passers |= 1u64 << sq; }
+        }
+    }
+    let mut black_passers = 0u64;
+    {
+        let mut bb = bp;
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            if wp & passed_mask_white(sq ^ 56) == 0 { black_passers |= 1u64 << sq; }
+        }
+    }
+
+    // White sliders (rooks + queens)
+    let wsliders = pos.pieces[0][Piece::Rook as usize] | pos.pieces[0][Piece::Queen as usize];
+    let mut bb = wsliders;
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        let file_mask = FILE_A << file_of(sq);
+        let rank = rank_of(sq);
+        // Own passer on same file at higher rank (slider is behind it)
+        let above = !0u64 << ((rank + 1) * 8);
+        if white_passers & file_mask & above != 0 { mg += TARRASCH_OWN_MG; eg += TARRASCH_OWN_EG; }
+        // Enemy passer on same file at lower rank (slider restrains it from behind)
+        let below = if rank > 0 { (1u64 << (rank * 8)) - 1 } else { 0 };
+        if black_passers & file_mask & below != 0 { mg += TARRASCH_ENEMY_MG; eg += TARRASCH_ENEMY_EG; }
+    }
+
+    // Black sliders
+    let bsliders = pos.pieces[1][Piece::Rook as usize] | pos.pieces[1][Piece::Queen as usize];
+    let mut bb = bsliders;
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        let file_mask = FILE_A << file_of(sq);
+        let rank = rank_of(sq);
+        // Own passer on same file at lower rank (slider behind it from black's direction)
+        let below = if rank > 0 { (1u64 << (rank * 8)) - 1 } else { 0 };
+        if black_passers & file_mask & below != 0 { mg -= TARRASCH_OWN_MG; eg -= TARRASCH_OWN_EG; }
+        // Enemy (white) passer on same file at higher rank (slider restrains it)
+        let above = !0u64 << ((rank + 1) * 8);
+        if white_passers & file_mask & above != 0 { mg -= TARRASCH_ENEMY_MG; eg -= TARRASCH_ENEMY_EG; }
+    }
+
+    (mg, eg)
+}
+
+/// Connected passed pawns: two passed pawns on adjacent files both get a bonus.
+fn eval_connected_passers(pos: &Position) -> (i32, i32) {
+    let mut mg = 0i32; let mut eg = 0i32;
+    let wp = pos.pieces[0][Piece::Pawn as usize];
+    let bp = pos.pieces[1][Piece::Pawn as usize];
+
+    let mut white_passers = 0u64;
+    {
+        let mut bb = wp;
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            if bp & passed_mask_white(sq) == 0 { white_passers |= 1u64 << sq; }
+        }
+    }
+    let mut black_passers = 0u64;
+    {
+        let mut bb = bp;
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            if wp & passed_mask_white(sq ^ 56) == 0 { black_passers |= 1u64 << sq; }
+        }
+    }
+
+    // A passer is "connected" if there is another passer on an adjacent file (any rank)
+    // Shift passer bitboard left/right by 8 (one file) within the board
+    let wp_conn = ((white_passers & !FILE_A) >> 1) | ((white_passers & !FILE_H) << 1);
+    let connected_w = (white_passers & wp_conn).count_ones() as i32;
+    mg += connected_w * CONNECTED_PASSERS_MG;
+    eg += connected_w * CONNECTED_PASSERS_EG;
+
+    let bp_conn = ((black_passers & !FILE_A) >> 1) | ((black_passers & !FILE_H) << 1);
+    let connected_b = (black_passers & bp_conn).count_ones() as i32;
+    mg -= connected_b * CONNECTED_PASSERS_MG;
+    eg -= connected_b * CONNECTED_PASSERS_EG;
+
+    (mg, eg)
+}
+
 pub fn evaluate(pos: &Position) -> i32 {
     let mut mg = 0i32; let mut eg = 0i32; let mut phase = 0i32;
     let occ = pos.occupancy[0] | pos.occupancy[1];
@@ -587,7 +714,15 @@ pub fn evaluate(pos: &Position) -> i32 {
     let (crmg, creg) = eval_connected_rooks(pos, occ);
     mg += crmg; eg += creg;
 
+    let (tmg, teg) = eval_tarrasch(pos);
+    mg += tmg; eg += teg;
+
+    let (cpmg, cpeg) = eval_connected_passers(pos);
+    mg += cpmg; eg += cpeg;
+
     mg += eval_king_safety(pos, occ, phase);
+
+    mg += eval_space(pos, phase);
 
     let score = (mg * phase + eg * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
 

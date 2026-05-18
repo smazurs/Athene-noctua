@@ -427,6 +427,28 @@ impl<'a> Search<'a> {
         } else { (false, false) };
 
         let ordered = self.order_moves(pos, &moves, tt_move, ply);
+
+        // Multi-cut: if multiple moves fail high at reduced depth, prune
+        if !is_pv && !in_check && depth >= 7 && skip_move.is_none()
+            && beta.abs() < MATE_THRESHOLD && static_eval >= beta
+        {
+            let mc_r = 3i32;
+            let mc_c = 3usize;
+            let mut mc_count = 0usize;
+            for mv in ordered.iter().take(8) {
+                if skip_move == Some(*mv) { continue; }
+                pos.make_move(*mv);
+                self.nodes += 1;
+                let s = -self.negamax(pos, -beta, -beta + 1, depth - 1 - mc_r, ply + 1, false, None);
+                pos.unmake_move(*mv);
+                if self.stopped { return 0; }
+                if s >= beta {
+                    mc_count += 1;
+                    if mc_count >= mc_c { return beta; }
+                }
+            }
+        }
+
         let orig_alpha = alpha;
         let mut best_score = -INF;
         let mut best_move = NULL_MOVE;
@@ -495,6 +517,7 @@ impl<'a> Search<'a> {
                     let hist_adj = (hs / 4000).clamp(-2, 2);
                     let mut reduction = (base - hist_adj).max(0).min(depth - 1);
                     if !improving { reduction += 1; }
+                    if is_pv && reduction > 1 { reduction -= 1; }
                     reduction
                 } else { 0 };
 
