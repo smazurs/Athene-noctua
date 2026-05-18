@@ -190,13 +190,6 @@ impl<'a> Search<'a> {
         }
     }
 
-    fn corrected_static_eval(&self, pos: &Position) -> i32 {
-        let raw = evaluate(pos);
-        let idx = pos.pawn_zobrist as usize % CORRHIST_SIZE;
-        let corr = self.corrhist[pos.side as usize][idx] / CORRHIST_GRAIN;
-        (raw + corr).clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
-    }
-
     fn update_corrhist(&mut self, pos: &Position, depth: i32, best_score: i32, raw_eval: i32) {
         if best_score.abs() >= MATE_THRESHOLD || raw_eval.abs() >= MATE_THRESHOLD { return; }
         let delta = best_score - raw_eval;
