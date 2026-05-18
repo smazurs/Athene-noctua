@@ -128,6 +128,10 @@ struct Search<'a> {
     cont_hist: Box<[[i32; 64]; 64]>,
     // Capture history indexed by [from][to]
     cap_hist: Box<[[i32; 64]; 64]>,
+    // Countermove heuristic: indexed by [from][to] of opponent's last move
+    countermoves: Box<[[Move; 64]; 64]>,
+    // Precomputed LMR table [depth][move_index]
+    lmr: [[i32; 64]; 64],
     // Static eval at each ply (for improving flag)
     eval_stack: [i32; MAX_PLY],
     pv_table: Vec<Vec<Move>>,
@@ -137,6 +141,13 @@ struct Search<'a> {
 
 impl<'a> Search<'a> {
     fn new(params: &'a SearchParams, tt: &'a mut TT) -> Self {
+        // Precompute LMR table
+        let mut lmr = [[0i32; 64]; 64];
+        for d in 1..64usize {
+            for i in 1..64usize {
+                lmr[d][i] = ((d as f32).ln() * (i as f32).ln() / 2.0) as i32;
+            }
+        }
         Search {
             params,
             tt,
@@ -145,6 +156,8 @@ impl<'a> Search<'a> {
             history: Box::new([[0i32; 64]; 64]),
             cont_hist: Box::new([[0i32; 64]; 64]),
             cap_hist: Box::new([[0i32; 64]; 64]),
+            countermoves: Box::new([[NULL_MOVE; 64]; 64]),
+            lmr,
             eval_stack: [0i32; MAX_PLY],
             pv_table: vec![Vec::new(); MAX_PLY + 1],
             prev_move: [NULL_MOVE; MAX_PLY],
@@ -193,6 +206,11 @@ impl<'a> Search<'a> {
         if mv.is_promotion() { return 1_900_000; }
         if mv == self.killers[ply][0] { return 800_000; }
         if mv == self.killers[ply][1] { return 700_000; }
+        // Countermove heuristic
+        let pm = self.prev_move[ply.saturating_sub(1)];
+        if !pm.is_null() && mv == self.countermoves[pm.from() as usize][pm.to() as usize] {
+            return 600_000;
+        }
         self.hist_score(mv, ply)
     }
 
@@ -335,8 +353,16 @@ impl<'a> Search<'a> {
             }
         }
 
+        // Razoring: at low depths, if static eval is far below alpha, do qsearch
+        if !is_pv && !in_check && depth <= 2 && skip_move.is_none() {
+            if static_eval + 350 + 150 * depth < alpha {
+                let qs = self.quiesce(pos, alpha, beta, ply);
+                if qs < alpha { return qs; }
+            }
+        }
+
         // Singular extensions: if TT move exists and may be singular, verify
-        let singular_ext = if !is_root && !in_check && skip_move.is_none()
+        let (singular_ext, double_ext) = if !is_root && !in_check && skip_move.is_none()
             && depth >= 6 && !tt_move.is_null()
             && {
                 let tt_ok = self.tt.probe(pos.zobrist)
@@ -351,8 +377,10 @@ impl<'a> Search<'a> {
             let s_beta = (tt_score - depth * 2).max(-MATE_SCORE);
             let s_score = self.negamax(pos, s_beta - 1, s_beta, depth / 2, ply, skip_null, Some(tt_move));
             if self.stopped { return 0; }
-            s_score < s_beta // singular if reduced search fails low
-        } else { false };
+            let is_singular = s_score < s_beta;
+            let is_double = is_singular && s_score < s_beta - 15;
+            (is_singular, is_double)
+        } else { (false, false) };
 
         let ordered = self.order_moves(pos, &moves, tt_move, ply);
         let orig_alpha = alpha;
@@ -399,8 +427,9 @@ impl<'a> Search<'a> {
             if is_quiet { quiets_tried += 1; }
 
             // Extensions
-            let ext = if singular_ext && *mv == tt_move { 1 }
-                      else { 0 };
+            let ext = if singular_ext && *mv == tt_move {
+                if double_ext { 2 } else { 1 }
+            } else { 0 };
 
             pos.make_move(*mv);
             self.nodes += 1;
@@ -409,9 +438,9 @@ impl<'a> Search<'a> {
             let score = if i == 0 {
                 -self.negamax(pos, -beta, -alpha, depth - 1 + ext, ply + 1, false, None)
             } else {
-                // Late-move reductions
+                // Late-move reductions (use precomputed LMR table)
                 let mut r = if (is_quiet || is_capture && see_score < 0) && depth >= 3 && i >= 3 {
-                    let base = ((depth as f32).ln() * (i as f32).ln() / 2.0) as i32;
+                    let base = self.lmr[depth.min(63) as usize][i.min(63)];
                     let hs = self.hist_score(*mv, ply);
                     let hist_adj = (hs / 4000).clamp(-2, 2);
                     let mut reduction = (base - hist_adj).max(0).min(depth - 1);
@@ -453,6 +482,11 @@ impl<'a> Search<'a> {
                         if !tried.is_capture() && !tried.is_ep() && !tried.is_promotion() {
                             self.update_history(tried, depth, ply, false);
                         }
+                    }
+                    // Countermove: record this quiet move as a response to opponent's last move
+                    let pm = self.prev_move[ply.saturating_sub(1)];
+                    if !pm.is_null() {
+                        self.countermoves[pm.from() as usize][pm.to() as usize] = *mv;
                     }
                 } else if is_capture {
                     self.update_cap_hist(*mv, depth, true);
@@ -568,6 +602,9 @@ pub fn search(pos: &mut Position, params: &SearchParams, tt: &mut TT) -> SearchR
         }
         result.nodes = searcher.nodes;
 
+        // Score drop (positive means score got worse this depth)
+        let score_drop = prev_score - score;
+
         // Track best move stability for time scaling
         if best == prev_best && !best.is_null() {
             stability += 1;
@@ -593,15 +630,21 @@ pub fn search(pos: &mut Position, params: &SearchParams, tt: &mut TT) -> SearchR
 
         if score.abs() > MATE_THRESHOLD { break; }
         if let Some(soft) = params.soft_limit {
-            // Scale soft limit by stability: use less time when best move is stable
-            let scale = match stability {
+            // Stability scaling: use less time when best move is stable
+            let stability_scale = match stability {
                 0 => 160u64,  // just changed: use 60% more time
                 1 => 120,
                 2 => 100,
                 3 => 85,
                 _ => 70,      // very stable: save 30%
             };
-            if searcher.elapsed_ms() * 100 >= soft * scale { break; }
+            // Score-drop scaling: use more time when score dropped significantly
+            let drop_scale = if score_drop > 60 { 160u64 }
+                             else if score_drop > 30 { 130u64 }
+                             else { 100u64 };
+            // Combined scale (product, normalized so 100*100 = 100%)
+            let combined = stability_scale * drop_scale / 100;
+            if searcher.elapsed_ms() * 100 >= soft * combined { break; }
         }
     }
 

@@ -145,6 +145,17 @@ const QUEEN_MOB_EG: [i32; 28]  = [
 // ── King attack weights (knight, bishop, rook, queen) ────────────────────────
 const KING_ATK_WT: [i32; 4] = [2, 2, 3, 5];
 
+// ── Pawn threat bonus (indexed by piece type attacked) ───────────────────────
+const PAWN_THREAT: [i32; 6] = [0, 40, 40, 60, 80, 0];
+
+// ── Outpost bonuses [knight, bishop] ─────────────────────────────────────────
+const OUTPOST_MG: [i32; 2] = [22, 10];
+const OUTPOST_EG: [i32; 2] = [12, 6];
+
+// ── Connected rooks bonus ─────────────────────────────────────────────────────
+const CONNECTED_ROOKS_MG: i32 = 10;
+const CONNECTED_ROOKS_EG: i32 = 5;
+
 /// Bulk pawn attack bitboard for all pawns of given color.
 fn pawn_attack_bb(pawns: u64, color: usize) -> u64 {
     if color == 0 {
@@ -317,6 +328,112 @@ fn eval_king_safety(pos: &Position, occ: u64, phase: i32) -> i32 {
     score * phase / TOTAL_PHASE
 }
 
+/// Pawn threats: bonus for pawns attacking enemy pieces.
+fn eval_threats(pos: &Position) -> (i32, i32) {
+    let mut mg = 0i32; let mut eg = 0i32;
+
+    // White pawns attacking black pieces
+    let wp_attacks = pawn_attack_bb(pos.pieces[0][Piece::Pawn as usize], 0);
+    for piece in 0..6usize {
+        let threatened = (wp_attacks & pos.pieces[1][piece]).count_ones() as i32;
+        mg += PAWN_THREAT[piece] * threatened;
+        eg += PAWN_THREAT[piece] * threatened;
+    }
+
+    // Black pawns attacking white pieces
+    let bp_attacks = pawn_attack_bb(pos.pieces[1][Piece::Pawn as usize], 1);
+    for piece in 0..6usize {
+        let threatened = (bp_attacks & pos.pieces[0][piece]).count_ones() as i32;
+        mg -= PAWN_THREAT[piece] * threatened;
+        eg -= PAWN_THREAT[piece] * threatened;
+    }
+
+    (mg, eg)
+}
+
+/// Outpost bonuses for knights and bishops.
+fn eval_outposts(pos: &Position) -> (i32, i32) {
+    let mut mg = 0i32; let mut eg = 0i32;
+
+    // Masks for outpost ranks: white rank 4-7 (bits 24..63), black rank 1-4 (bits 0..39)
+    const OUTPOST_RANKS_WHITE: u64 = 0xFFFF_FFFF_0000_0000u64; // ranks 4-7
+    const OUTPOST_RANKS_BLACK: u64 = 0x0000_00FF_FFFF_FFFFu64; // ranks 1-4 (from black's view rank 4-7)
+
+    let wp_attacks = pawn_attack_bb(pos.pieces[0][Piece::Pawn as usize], 0);
+    let bp_attacks = pawn_attack_bb(pos.pieces[1][Piece::Pawn as usize], 1);
+
+    // White outpost squares: rank 4-7 and not attacked by black pawns
+    let white_outpost_sq = OUTPOST_RANKS_WHITE & !bp_attacks;
+    // Black outpost squares: rank 1-4 and not attacked by white pawns
+    let black_outpost_sq = OUTPOST_RANKS_BLACK & !wp_attacks;
+
+    // Piece types: knight=1, bishop=2 (indices 0=N, 1=B into OUTPOST arrays)
+    for (pi, piece) in [(Piece::Knight as usize, 0usize), (Piece::Bishop as usize, 1usize)] {
+        // White pieces
+        let mut bb = pos.pieces[0][pi];
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            let sq_bb = 1u64 << sq;
+            if sq_bb & white_outpost_sq != 0 {
+                // On outpost
+                mg += OUTPOST_MG[piece];
+                eg += OUTPOST_EG[piece];
+            } else if pi == Piece::Knight as usize {
+                // Can reach an outpost in one knight move?
+                if knight_attacks(sq) & white_outpost_sq != 0 {
+                    mg += OUTPOST_MG[piece] / 2;
+                    eg += OUTPOST_EG[piece] / 2;
+                }
+            }
+        }
+
+        // Black pieces
+        let mut bb = pos.pieces[1][pi];
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            let sq_bb = 1u64 << sq;
+            if sq_bb & black_outpost_sq != 0 {
+                mg -= OUTPOST_MG[piece];
+                eg -= OUTPOST_EG[piece];
+            } else if pi == Piece::Knight as usize {
+                if knight_attacks(sq) & black_outpost_sq != 0 {
+                    mg -= OUTPOST_MG[piece] / 2;
+                    eg -= OUTPOST_EG[piece] / 2;
+                }
+            }
+        }
+    }
+
+    (mg, eg)
+}
+
+/// Connected rooks bonus: two rooks of same color on same rank/file with no pieces between.
+fn eval_connected_rooks(pos: &Position, occ: u64) -> (i32, i32) {
+    let mut mg = 0i32; let mut eg = 0i32;
+
+    for color in 0..2usize {
+        let sign = if color == 0 { 1i32 } else { -1 };
+        let rooks = pos.pieces[color][Piece::Rook as usize];
+        if rooks.count_ones() < 2 { continue; }
+
+        let mut bb = rooks;
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            // Check if rook attacks land on another friendly rook
+            if rook_attacks(sq, occ) & rooks != 0 {
+                mg += sign * CONNECTED_ROOKS_MG;
+                eg += sign * CONNECTED_ROOKS_EG;
+            }
+        }
+        // Divide by 2 since each pair is counted twice (once from each rook)
+        mg = mg; // already counted per-rook, but each pair gives bonus once per rook = 2x; keep as is for now
+    }
+
+    // Actually we want to count each connected pair once. Since we counted from both ends,
+    // divide by 2. But to keep integer arithmetic simple, we halve below.
+    (mg / 2, eg / 2)
+}
+
 pub fn evaluate(pos: &Position) -> i32 {
     let mut mg = 0i32; let mut eg = 0i32; let mut phase = 0i32;
     let occ = pos.occupancy[0] | pos.occupancy[1];
@@ -352,6 +469,15 @@ pub fn evaluate(pos: &Position) -> i32 {
 
     let (mmg, meg) = eval_mobility(pos, occ);
     mg += mmg; eg += meg;
+
+    let (tmg, teg) = eval_threats(pos);
+    mg += tmg; eg += teg;
+
+    let (omg, oeg) = eval_outposts(pos);
+    mg += omg; eg += oeg;
+
+    let (crmg, creg) = eval_connected_rooks(pos, occ);
+    mg += crmg; eg += creg;
 
     mg += eval_king_safety(pos, occ, phase);
 
