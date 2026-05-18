@@ -5,7 +5,7 @@ use crate::board::{
     position::Position,
     types::Piece,
 };
-use crate::eval::evaluate;
+use crate::eval::{evaluate, evaluate_quick, evaluate_with_ptable, PawnTable};
 use crate::movegen::generate_legal_moves;
 use crate::tt::{TT, TT_EXACT, TT_LOWER, TT_UPPER};
 use std::time::Instant;
@@ -28,6 +28,7 @@ const FP_MARGIN: [i32; 5] = [0, 100, 200, 300, 400];
 const LMP_IMPROVING:     [usize; 5] = [0, 10, 16, 24, 32];
 const LMP_NOT_IMPROVING: [usize; 5] = [0,  5,  9, 14, 19];
 const PROBCUT_MARGIN: i32 = 150;
+const LAZY_EVAL_MARGIN: i32 = 300; // skip full eval when quick eval is far outside window
 const CORRHIST_SIZE: usize = 16384;
 const CORRHIST_GRAIN: i32 = 256;
 const CORRHIST_MAX: i32 = 1024 * CORRHIST_GRAIN;
@@ -140,6 +141,7 @@ struct Search<'a> {
     pv_table: Vec<Vec<Move>>,
     prev_move: [Move; MAX_PLY],
     stopped: bool,
+    pawn_table: PawnTable,
     corrhist: Box<[[i32; CORRHIST_SIZE]; 2]>,
     cont_hist2: Box<[[i32; 64]; 64]>,
     root_best_nodes: u64,
@@ -169,6 +171,7 @@ impl<'a> Search<'a> {
             pv_table: vec![Vec::new(); MAX_PLY + 1],
             prev_move: [NULL_MOVE; MAX_PLY],
             stopped: false,
+            pawn_table: PawnTable::new(),
             corrhist: Box::new([[0i32; CORRHIST_SIZE]; 2]),
             cont_hist2: Box::new([[0i32; 64]; 64]),
             root_best_nodes: 0,
@@ -334,7 +337,17 @@ impl<'a> Search<'a> {
         }
 
         // Static evaluation + improving flag
-        let raw_eval = if !in_check { evaluate(pos) } else { -INF };
+        let raw_eval = if !in_check {
+            // Lazy evaluation: use quick eval first; only do full eval if needed
+            let quick = evaluate_quick(pos);
+            if !is_pv && !skip_null
+                && (quick > beta + LAZY_EVAL_MARGIN || quick < alpha - LAZY_EVAL_MARGIN)
+            {
+                quick
+            } else {
+                evaluate_with_ptable(pos, &mut self.pawn_table)
+            }
+        } else { -INF };
         let static_eval = if !in_check {
             let idx = pos.pawn_zobrist as usize % CORRHIST_SIZE;
             let corr = self.corrhist[pos.side as usize][idx] / CORRHIST_GRAIN;
@@ -616,7 +629,7 @@ impl<'a> Search<'a> {
         } else { NULL_MOVE };
 
         let stand_pat = if !in_check {
-            let sp = evaluate(pos);
+            let sp = evaluate_with_ptable(pos, &mut self.pawn_table);
             if sp >= beta { return sp; }
             // Delta pruning
             const DELTA: i32 = 1025 + 200;
