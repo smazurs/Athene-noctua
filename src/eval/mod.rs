@@ -127,34 +127,34 @@ const ROOK_SEVENTH_MG: i32 = 20;
 const ROOK_SEVENTH_EG: i32 = 30;
 
 // ── Mobility tables (bonus per number of reachable squares) ──────────────────
-const KNIGHT_MOB_MG: [i32; 9]  = [-25, -15, -5,  0,  5, 10, 15, 20, 23];
-const KNIGHT_MOB_EG: [i32; 9]  = [-30, -18, -6,  0,  6, 12, 18, 24, 28];
-const BISHOP_MOB_MG: [i32; 14] = [-20, -10, -5,  0,  3,  6,  9, 12, 14, 16, 18, 20, 22, 24];
-const BISHOP_MOB_EG: [i32; 14] = [-25, -12, -6,  0,  4,  8, 12, 16, 20, 24, 28, 32, 36, 38];
-const ROOK_MOB_MG:   [i32; 15] = [-10,  -5,  0,  3,  6,  9, 12, 15, 18, 21, 24, 27, 30, 33, 36];
-const ROOK_MOB_EG:   [i32; 15] = [-20, -10,  0,  5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60];
+const KNIGHT_MOB_MG: [i32; 9]  = [-15,  -9,  -3,  0,  3,  6,  9, 12, 14];
+const KNIGHT_MOB_EG: [i32; 9]  = [-18, -11,  -4,  0,  4,  7, 11, 14, 17];
+const BISHOP_MOB_MG: [i32; 14] = [-12,  -6,  -3,  0,  2,  4,  5,  7,  8, 10, 11, 12, 13, 14];
+const BISHOP_MOB_EG: [i32; 14] = [-15,  -7,  -4,  0,  2,  5,  7, 10, 12, 14, 17, 19, 22, 23];
+const ROOK_MOB_MG:   [i32; 15] = [ -6,  -3,   0,  2,  4,  5,  7,  9, 11, 13, 14, 16, 18, 20, 22];
+const ROOK_MOB_EG:   [i32; 15] = [-12,  -6,   0,  3,  6,  9, 12, 15, 18, 21, 24, 27, 30, 33, 36];
 const QUEEN_MOB_MG: [i32; 28]  = [
-    -20, -12, -8, -4, 0, 2, 4, 6, 8, 10, 11, 12, 13, 14,
-     14,  15, 15, 16, 16, 17, 17, 17, 18, 18, 18, 18, 18, 18,
+    -12, -7, -5, -2, 0, 1, 2, 4, 5, 6, 7, 7, 8, 8,
+      8,  9,  9, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11,
 ];
 const QUEEN_MOB_EG: [i32; 28]  = [
-    -40, -25, -16, -8, 0, 5, 10, 14, 18, 22, 26, 29, 32, 35,
-     38,  40,  42, 44, 45, 46, 47, 48, 49, 50, 50, 50, 50, 50,
+    -24, -15, -10, -5, 0, 3, 6, 8, 11, 13, 16, 17, 19, 21,
+     23,  24,  25, 26, 27, 28, 28, 29, 29, 30, 30, 30, 30, 30,
 ];
 
 // ── King attack weights (knight, bishop, rook, queen) ────────────────────────
 const KING_ATK_WT: [i32; 4] = [2, 2, 3, 5];
 
 // ── Pawn threat bonus (indexed by piece type attacked) ───────────────────────
-const PAWN_THREAT: [i32; 6] = [0, 40, 40, 60, 80, 0];
+const PAWN_THREAT: [i32; 6] = [0, 28, 28, 42, 56, 0];
 
 // ── Outpost bonuses [knight, bishop] ─────────────────────────────────────────
-const OUTPOST_MG: [i32; 2] = [22, 10];
-const OUTPOST_EG: [i32; 2] = [12, 6];
+const OUTPOST_MG: [i32; 2] = [15, 7];
+const OUTPOST_EG: [i32; 2] = [8, 4];
 
 // ── Connected rooks bonus ─────────────────────────────────────────────────────
-const CONNECTED_ROOKS_MG: i32 = 10;
-const CONNECTED_ROOKS_EG: i32 = 5;
+const CONNECTED_ROOKS_MG: i32 = 7;
+const CONNECTED_ROOKS_EG: i32 = 3;
 
 // ── Backward pawn penalties ───────────────────────────────────────────────────
 const BACKWARD_MG: i32 = 12;
@@ -164,29 +164,29 @@ const BACKWARD_EG: i32 = 15;
 // Light squares: (rank+file) odd; dark squares: (rank+file) even
 const LIGHT_SQUARES: u64 = 0xAA55AA55AA55AA55;
 const DARK_SQUARES:  u64 = 0x55AA55AA55AA55AA;
-const BAD_BISHOP_EG: i32 = 4;  // penalty per own pawn on same color as bishop
+const BAD_BISHOP_EG: i32 = 3;  // penalty per own pawn on same color as bishop
 
 // ── Space evaluation ──────────────────────────────────────────────────────────
 // Safe center squares (files c-f) in own forward area, MG only
-const SPACE_BONUS_MG: i32 = 2;  // per safe center square
+const SPACE_BONUS_MG: i32 = 1;  // per safe center square
 
 // ── Tarrasch rule (rook/queen behind passed pawn) ─────────────────────────────
-const TARRASCH_OWN_MG: i32 = 15;
-const TARRASCH_OWN_EG: i32 = 25;
-const TARRASCH_ENEMY_MG: i32 = 8;
-const TARRASCH_ENEMY_EG: i32 = 15;
+const TARRASCH_OWN_MG: i32 = 10;
+const TARRASCH_OWN_EG: i32 = 17;
+const TARRASCH_ENEMY_MG: i32 = 6;
+const TARRASCH_ENEMY_EG: i32 = 10;
 
 // ── Connected passed pawns bonus ──────────────────────────────────────────────
-const CONNECTED_PASSERS_MG: i32 = 18;
-const CONNECTED_PASSERS_EG: i32 = 30;
+const CONNECTED_PASSERS_MG: i32 = 12;
+const CONNECTED_PASSERS_EG: i32 = 20;
 
 // ── Tempo bonus (side to move small advantage) ────────────────────────────────
-const TEMPO: i32 = 15;
+const TEMPO: i32 = 10;
 
 // ── King proximity bonus per rank/file (endgame only) ────────────────────────
 // Closer king to enemy pieces = better in endgame
-const KING_PAWN_PROX_EG: i32 = 5;  // per step of Chebyshev distance saved
-const KING_KING_PROX_EG: i32 = 2;  // close kings are good for the stronger side
+const KING_PAWN_PROX_EG: i32 = 3;  // per step of Chebyshev distance saved
+const KING_KING_PROX_EG: i32 = 1;  // close kings are good for the stronger side
 
 #[inline]
 fn chebyshev(a: u32, b: u32) -> i32 {
