@@ -94,6 +94,9 @@ fn main() {
 }
 
 fn run_bench() {
+    use search::{search, SearchParams};
+    use tt::TT;
+    // Standard bench positions (EPD subset)
     let positions = [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
@@ -101,18 +104,39 @@ fn run_bench() {
         "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
         "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
         "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        "2r3k1/1p3ppp/pq3b2/3p4/8/1P2P1P1/P3QPBP/R5K1 b - - 0 22",
+        "r1b2rk1/2q1bppp/p2p1n2/np2p3/3PP3/2P1BN2/PP1NBQPP/R4RK1 w - - 0 13",
+        "1r2r1k1/3bnppp/p2q4/2pNpP2/PpB1P3/1P4P1/3QB2P/1R2R1K1 w - - 0 21",
+        "r4r1k/pp2q1pp/2p1b3/2Pp1p2/1P1P4/P2BPQ2/5PPP/R3R1K1 w - - 0 21",
     ];
 
-    let depth = 5;
+    let depth = 12;
     let mut total_nodes = 0u64;
-    let start = std::time::Instant::now();
+    let mut total_time = 0u64;
+    let overall_start = std::time::Instant::now();
+    let mut tt = TT::new(64); // 64MB TT for bench
 
     for fen in &positions {
         let mut pos = board::position::Position::from_fen(fen).unwrap();
-        let nodes = uci::perft(&mut pos, depth);
-        total_nodes += nodes;
+        tt.clear();
+        let start = std::time::Instant::now();
+        let params = SearchParams {
+            start,
+            soft_limit: None,
+            hard_limit: None,
+            depth_limit: Some(depth),
+            node_limit: None,
+        };
+        let result = search(&mut pos, &params, &mut tt);
+        let elapsed = start.elapsed().as_millis() as u64;
+        total_nodes += result.nodes;
+        total_time += elapsed;
+        println!("depth {} nodes {} time {}ms", result.depth, result.nodes, elapsed);
     }
 
-    let elapsed = start.elapsed();
-    println!("Bench: {} nodes in {:.2}s", total_nodes, elapsed.as_secs_f64());
+    let elapsed_total = overall_start.elapsed().as_secs_f64();
+    let nps = if elapsed_total > 0.0 { (total_nodes as f64 / elapsed_total) as u64 } else { total_nodes };
+    println!("Bench: {} nodes {} nps in {:.2}s",
+        total_nodes, nps, elapsed_total);
+    let _ = total_time;
 }

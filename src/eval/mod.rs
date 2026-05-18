@@ -156,6 +156,21 @@ const OUTPOST_EG: [i32; 2] = [12, 6];
 const CONNECTED_ROOKS_MG: i32 = 10;
 const CONNECTED_ROOKS_EG: i32 = 5;
 
+// ── Tempo bonus (side to move small advantage) ────────────────────────────────
+const TEMPO: i32 = 15;
+
+// ── King proximity bonus per rank/file (endgame only) ────────────────────────
+// Closer king to enemy pieces = better in endgame
+const KING_PAWN_PROX_EG: i32 = 5;  // per step of Chebyshev distance saved
+const KING_KING_PROX_EG: i32 = 2;  // close kings are good for the stronger side
+
+#[inline]
+fn chebyshev(a: u32, b: u32) -> i32 {
+    let dr = (rank_of(a) as i32 - rank_of(b) as i32).abs();
+    let df = (file_of(a) as i32 - file_of(b) as i32).abs();
+    dr.max(df)
+}
+
 /// Bulk pawn attack bitboard for all pawns of given color.
 fn pawn_attack_bb(pawns: u64, color: usize) -> u64 {
     if color == 0 {
@@ -434,6 +449,39 @@ fn eval_connected_rooks(pos: &Position, occ: u64) -> (i32, i32) {
     (mg / 2, eg / 2)
 }
 
+/// In the endgame, reward the stronger side's king for being close to
+/// enemy pawns and close to the enemy king (to restrict it).
+fn eval_king_proximity(pos: &Position, phase: i32) -> i32 {
+    if phase >= 12 { return 0; } // only meaningful in endgame
+    let eg_frac = TOTAL_PHASE - phase; // 0..24
+    let wk = pos.king_sq(Color::White);
+    let bk = pos.king_sq(Color::Black);
+    let mut score = 0i32;
+
+    // White king close to black pawns (attacking them)
+    let mut bb = pos.pieces[1][Piece::Pawn as usize];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        score += (7 - chebyshev(wk, sq)) * KING_PAWN_PROX_EG;
+    }
+    // Black king close to white pawns
+    let mut bb = pos.pieces[0][Piece::Pawn as usize];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        score -= (7 - chebyshev(bk, sq)) * KING_PAWN_PROX_EG;
+    }
+    // Kings closer together → restricts the losing king
+    // Bonus for the winning side (approximated by whoever is ahead in eval)
+    // We'll apply a symmetric proximity bonus; the caller can decide sign
+    let king_dist = chebyshev(wk, bk);
+    // Both sides benefit from chasing the enemy king to the edge
+    // Use the simple: square of (7-dist) as a proximity bonus to eval
+    let _ = king_dist; // used below
+    score += (7 - king_dist) * KING_KING_PROX_EG;
+
+    score * eg_frac / TOTAL_PHASE
+}
+
 pub fn evaluate(pos: &Position) -> i32 {
     let mut mg = 0i32; let mut eg = 0i32; let mut phase = 0i32;
     let occ = pos.occupancy[0] | pos.occupancy[1];
@@ -482,5 +530,11 @@ pub fn evaluate(pos: &Position) -> i32 {
     mg += eval_king_safety(pos, occ, phase);
 
     let score = (mg * phase + eg * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
-    if pos.side == Color::White { score } else { -score }
+
+    // King proximity is purely an endgame term
+    let prox = eval_king_proximity(pos, phase);
+    let raw = if pos.side == Color::White { score + prox } else { -score - prox };
+
+    // Tempo: small bonus for the side to move
+    raw + TEMPO
 }
