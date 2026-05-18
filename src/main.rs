@@ -3,6 +3,7 @@ mod eval;
 mod movegen;
 mod search;
 mod tt;
+mod tune;
 mod uci;
 
 use board::attacks;
@@ -88,6 +89,10 @@ fn main() {
             );
             let mut pos = board::position::Position::from_fen(fen).unwrap();
             uci::perft_divide(&mut pos, depth);
+        }
+        Some("tune") => {
+            let path = args.get(2).map(String::as_str).unwrap_or("dataset.epd");
+            tune::run_tune(path);
         }
         _ => uci::run_uci(),
     }
