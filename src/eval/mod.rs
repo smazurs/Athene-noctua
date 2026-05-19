@@ -188,6 +188,14 @@ const TEMPO: i32 = 10;
 const KING_PAWN_PROX_EG: i32 = 3;  // per step of Chebyshev distance saved
 const KING_KING_PROX_EG: i32 = 1;  // close kings are good for the stronger side
 
+// ── Center king penalty ──────────────────────────────────────────────────────
+const CENTER_KING_BASE: i32 = 35;   // base penalty when king is on c-f files
+const CENTER_KING_OPEN: i32 = 40;   // per fully open adjacent file
+const CENTER_KING_SEMI: i32 = 20;   // per semi-open adjacent file
+
+// ── King shelter (for flanked kings on c or f files) ─────────────────────────
+const SHELTER_SCALE_CF: i32 = 60;   // pawn shield scaled down to 60% for c/f files
+
 #[inline]
 fn chebyshev(a: u32, b: u32) -> i32 {
     let dr = (rank_of(a) as i32 - rank_of(b) as i32).abs();
@@ -356,7 +364,8 @@ fn eval_king_safety(pos: &Position, occ: u64, phase: i32) -> i32 {
         let forward = if color == 0 { 1i32 } else { -1 };
         let pawns = pos.pieces[color][Piece::Pawn as usize];
 
-        if kfile <= 1 || kfile >= 6 {
+        if kfile <= 2 || kfile >= 5 {
+            let cf_scale = if kfile <= 1 || kfile >= 6 { 100 } else { SHELTER_SCALE_CF };
             let mut shield = 0i32;
             for df in -1i32..=1 {
                 let f = kfile + df;
@@ -367,7 +376,7 @@ fn eval_king_safety(pos: &Position, occ: u64, phase: i32) -> i32 {
                 let pawn_r2 = r2 >= 0 && r2 < 8 && pawns & (1u64 << (r2 * 8 + f)) != 0;
                 shield += if pawn_r1 { 12 } else if pawn_r2 { 5 } else { -20 };
             }
-            score += sign * shield;
+            score += sign * shield * cf_scale / 100;
         }
 
         let king_zone = king_attacks(king_sq);
@@ -506,6 +515,38 @@ fn eval_connected_rooks(pos: &Position, occ: u64) -> (i32, i32) {
     // Actually we want to count each connected pair once. Since we counted from both ends,
     // divide by 2. But to keep integer arithmetic simple, we halve below.
     (mg / 2, eg / 2)
+}
+
+/// Penalty for a king stuck in center files (c–f) during the middlegame.
+/// d/e files get full penalty; c/f files get 55%.
+fn eval_center_king(pos: &Position, phase: i32) -> i32 {
+    if phase < 4 { return 0; }
+    let mut score = 0i32;
+    for color in 0..2usize {
+        let sign = if color == 0 { 1i32 } else { -1 };
+        let king_sq = pos.king_sq(if color == 0 { Color::White } else { Color::Black });
+        let kfile = file_of(king_sq) as i32;
+        let scale = match kfile {
+            3 | 4 => 100, // d, e: full penalty
+            2 | 5 =>  55, // c, f: partial penalty (queenside/kingside castle zones)
+            _ => continue,
+        };
+        let own_pawns = pos.pieces[color][Piece::Pawn as usize];
+        let opp_pawns = pos.pieces[color ^ 1][Piece::Pawn as usize];
+        let mut penalty = CENTER_KING_BASE;
+        for df in -1i32..=1 {
+            let f = kfile + df;
+            if f < 0 || f > 7 { continue; }
+            let fmask = FILE_A << f as u32;
+            penalty += match (own_pawns & fmask != 0, opp_pawns & fmask != 0) {
+                (false, false) => CENTER_KING_OPEN,
+                (false, true)  => CENTER_KING_SEMI,
+                _              => 0,
+            };
+        }
+        score -= sign * penalty * scale / 100 * phase / TOTAL_PHASE;
+    }
+    score
 }
 
 /// In the endgame, reward the stronger side's king for being close to
@@ -728,7 +769,9 @@ pub fn evaluate(pos: &Position) -> i32 {
 
     // King proximity is purely an endgame term
     let prox = eval_king_proximity(pos, phase);
-    let raw = if pos.side == Color::White { score + prox } else { -score - prox };
+    let center_pen = eval_center_king(pos, phase);
+    let raw = if pos.side == Color::White { score + prox + center_pen }
+              else { -score - prox - center_pen };
 
     // Tempo: small bonus for the side to move
     raw + TEMPO
